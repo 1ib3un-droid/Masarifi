@@ -321,6 +321,172 @@ function demoState(y){
   return S;
 }
 
+/* ===== CLOUD: optional sync through Firebase REST (no SDK) with optional end-to-end encryption ===== */
+const Cloud=(()=>{
+  const LSK='masrofi.cloud.v1';
+  let st={cfg:null,auth:null,pass:'',hashes:{},init:false,last:0};
+  try{const r=localStorage.getItem(LSK);if(r)st=Object.assign(st,JSON.parse(r));}catch(e){}
+  const persist=()=>{try{localStorage.setItem(LSK,JSON.stringify(st));}catch(e){}};
+  const ctl={status:'idle',msg:'',busy:false,again:false,timer:null,choice:null,idToken:null,exp:0,hooks:{getS:()=>null,setS:()=>{},onUpdate:()=>{}}};
+  const te=new TextEncoder(),td=new TextDecoder();
+  const mk=m=>new Error(m);
+  function hs(s){let a=0x811c9dc5,b=0x1b873593;for(let i=0;i<s.length;i++){const c=s.charCodeAt(i);a^=c;a=Math.imul(a,16777619);b=Math.imul(b^c,2246822519);}return (a>>>0).toString(36)+(b>>>0).toString(36)+s.length.toString(36);}
+  const b64=u=>{let s='';for(let i=0;i<u.length;i+=8192)s+=String.fromCharCode.apply(null,u.subarray(i,i+8192));return btoa(s);};
+  const unb64=s=>Uint8Array.from(atob(s),c=>c.charCodeAt(0));
+  /* ---- errors in Arabic ---- */
+  function errAr(e){
+    const m=String((e&&e.message)||e||'');
+    if(m==='OFFLINE')return 'لا يوجد اتصال بالإنترنت.';
+    if(m==='NEEDPASS')return 'بياناتك في السحابة مشفّرة. اكتب عبارة التشفير.';
+    if(m==='BADPASS')return 'عبارة التشفير غير صحيحة.';
+    if(/EMAIL_EXISTS/.test(m))return 'هذا الإيميل مسجّل مسبقاً. استخدم «دخول».';
+    if(/INVALID_LOGIN_CREDENTIALS|INVALID_PASSWORD|EMAIL_NOT_FOUND/.test(m))return 'الإيميل أو كلمة السر غير صحيحة.';
+    if(/WEAK_PASSWORD/.test(m))return 'كلمة السر ضعيفة (6 أحرف على الأقل).';
+    if(/INVALID_EMAIL|MISSING_EMAIL/.test(m))return 'الإيميل غير صحيح.';
+    if(/TOO_MANY_ATTEMPTS/.test(m))return 'محاولات كثيرة. انتظر قليلاً ثم جرّب.';
+    if(/ADMIN_ONLY_OPERATION/.test(m))return 'إنشاء الحسابات الجديدة موقوف في المشروع. استخدم «دخول».';
+    if(/OPERATION_NOT_ALLOWED/.test(m))return 'تسجيل الدخول بالإيميل غير مفعّل في Firebase.';
+    if(/API key not valid|INVALID_API_KEY|API_KEY/.test(m))return 'مفتاح الإعداد غير صحيح.';
+    if(/has not been used|SERVICE_DISABLED/.test(m))return 'خدمة Firestore غير مفعّلة. أنشئ Firestore Database من لوحة Firebase.';
+    if(/PERMISSION_DENIED|HTTP 403|insufficient permissions/i.test(m))return 'قواعد الحماية رفضت العملية. تأكد أنك نسخت القواعد كما هي وضغطت Publish.';
+    if(/NOT_FOUND|HTTP 404|does not exist/.test(m))return 'قاعدة البيانات غير منشأة. أنشئ Firestore Database من لوحة Firebase.';
+    if(/TOKEN_EXPIRED|USER_NOT_FOUND|INVALID_REFRESH_TOKEN|USER_DISABLED|CREDENTIAL_TOO_OLD/.test(m))return 'انتهت جلسة الدخول. سجّل دخول من جديد.';
+    return 'تعذّر الاتصال: '+m.slice(0,120);
+  }
+  /* ---- crypto ---- */
+  let kc={id:'',k:null};
+  async function key(pass,uid){const id=pass+'|'+uid;if(kc.id===id)return kc.k;
+    const base=await crypto.subtle.importKey('raw',te.encode(pass),'PBKDF2',false,['deriveKey']);
+    const k=await crypto.subtle.deriveKey({name:'PBKDF2',salt:te.encode('masrofi|'+uid),iterations:200000,hash:'SHA-256'},base,{name:'AES-GCM',length:256},false,['encrypt','decrypt']);
+    kc={id,k};return k;}
+  async function encStr(plain){if(!st.pass)return plain;const k=await key(st.pass,st.auth.uid);const iv=crypto.getRandomValues(new Uint8Array(12));
+    const ct=new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM',iv},k,te.encode(plain)));return 'e1.'+b64(iv)+'.'+b64(ct);}
+  async function decStr(s){if(!s.startsWith('e1.'))return s;if(!st.pass)throw mk('NEEDPASS');
+    try{const [,iv,ct]=s.split('.');const k=await key(st.pass,st.auth.uid);const pt=await crypto.subtle.decrypt({name:'AES-GCM',iv:unb64(iv)},k,unb64(ct));return td.decode(pt);}catch(e){throw mk('BADPASS');}}
+  /* ---- http ---- */
+  async function http(url,opt){let r;try{r=await fetch(url,opt);}catch(e){throw mk('OFFLINE');}
+    let j=null;try{j=await r.json();}catch(e){}
+    if(!r.ok){const e=mk((j&&j.error&&(j.error.message||j.error.status))||('HTTP '+r.status));e.code=r.status;throw e;}
+    return j||{};}
+  const authCall=(ep,body)=>http(`https://identitytoolkit.googleapis.com/v1/accounts:${ep}?key=${encodeURIComponent(st.cfg.apiKey)}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  async function token(){
+    if(ctl.idToken&&Date.now()<ctl.exp-300000)return ctl.idToken;
+    const r=await http(`https://securetoken.googleapis.com/v1/token?key=${encodeURIComponent(st.cfg.apiKey)}`,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'grant_type=refresh_token&refresh_token='+encodeURIComponent(st.auth.refresh)});
+    ctl.idToken=r.id_token;ctl.exp=Date.now()+(+r.expires_in||3600)*1000;if(r.refresh_token&&r.refresh_token!==st.auth.refresh){st.auth.refresh=r.refresh_token;persist();}
+    return ctl.idToken;}
+  const base=()=>`https://firestore.googleapis.com/v1/projects/${encodeURIComponent(st.cfg.projectId)}/databases/(default)/documents/users/${encodeURIComponent(st.auth.uid)}/docs`;
+  async function fs(path,method,body){const t=await token();
+    return http(base()+path,{method,headers:Object.assign({Authorization:'Bearer '+t},body?{'Content-Type':'application/json'}:{}),body:body?JSON.stringify(body):undefined});}
+  async function remoteList(){
+    const out={};let pt='';
+    do{const r=await fs('?pageSize=300'+(pt?'&pageToken='+encodeURIComponent(pt):''),'GET');
+      for(const d of (r.documents||[])){const id=d.name.split('/').pop();const f=d.fields||{};
+        out[id]={raw:(f.json&&f.json.stringValue)||'',ts:+((f.ts&&f.ts.integerValue)||0)};}
+      pt=r.nextPageToken||'';}while(pt);
+    for(const id in out)out[id].json=await decStr(out[id].raw);
+    return out;}
+  async function remotePut(id,plain){const s=await encStr(plain);
+    await fs('/'+encodeURIComponent(id),'PATCH',{fields:{json:{stringValue:s},ts:{integerValue:String(Date.now())}}});}
+  const remoteDel=id=>fs('/'+encodeURIComponent(id),'DELETE');
+  /* ---- state <-> docs ---- */
+  function splitDocs(S){
+    const m={};
+    m.meta=JSON.stringify({v:1,settings:{salary:S.settings.salary,items:S.settings.items},debts:S.debts,planned:S.planned});
+    for(const y in S.years)for(const mo in S.years[y].months)m['m_'+y+'_'+mo]=JSON.stringify({y:+y,m:+mo,M:S.years[y].months[mo]});
+    return m;}
+  function joinDocs(map,base){
+    let meta=null;const years={};
+    for(const id in map){let o;try{o=JSON.parse(map[id]);}catch(e){continue;}
+      if(id==='meta')meta=o;else if(/^m_\d+_\d+$/.test(id)&&o&&o.M){(years[o.y]=years[o.y]||{months:{}}).months[o.m]=o.M;}}
+    if(!meta)return null;
+    const S2=sanitize({v:1,settings:meta.settings,years,debts:meta.debts||[],planned:meta.planned||[]});
+    if(!S2)return null;
+    if(base){S2.settings.pin=base.settings.pin;S2.settings.lastBackup=base.settings.lastBackup;}
+    return S2;}
+  function hasData(S){return Object.keys(S.years).length>0||S.debts.length>0||S.planned.length>0||S.settings.salary>0||S.settings.items.some(i=>i.limit>0);}
+  function summary(map){const ids=Object.keys(map);const S2=joinDocs(Object.fromEntries(ids.map(i=>[i,map[i].json||map[i]])),null);
+    if(!S2)return{months:ids.filter(i=>i!=='meta').length,debts:0,planned:0};
+    let nm=0;for(const y in S2.years)nm+=Object.keys(S2.years[y].months).length;return{months:nm,debts:S2.debts.length,planned:S2.planned.length};}
+  const hashMap=m=>Object.fromEntries(Object.entries(m).map(([k,v])=>[k,hs(v)]));
+  /* ---- status ---- */
+  function setStatus(s,msg){ctl.status=s;ctl.msg=msg||'';ctl.hooks.onUpdate();}
+  /* ---- sync ---- */
+  async function sync(){
+    if(!st.cfg||!st.auth)return;
+    if(ctl.busy){ctl.again=true;return;}
+    ctl.busy=true;setStatus('syncing');
+    try{
+      const S=ctl.hooks.getS();let local=splitDocs(S);const remote=await remoteList();const rids=Object.keys(remote);
+      if(!st.init){
+        const rj=Object.fromEntries(rids.map(i=>[i,remote[i].json]));
+        if(!rids.length){for(const id in local)await remotePut(id,local[id]);st.hashes=hashMap(local);st.init=true;}
+        else if(!hasData(S)){const S2=joinDocs(rj,S);if(!S2)throw mk('بيانات السحابة غير مفهومة');ctl.hooks.setS(S2);st.hashes=hashMap(rj);st.init=true;}
+        else if(JSON.stringify(hashMap(rj))===JSON.stringify(hashMap(local))){st.hashes=hashMap(local);st.init=true;}
+        else{ctl.choice={remote:summary(remote),local:summary(Object.fromEntries(Object.entries(local).map(([k,v])=>[k,{json:v}])))};persist();ctl.busy=false;setStatus('needChoice');return;}
+        persist();
+      }else{
+        const H=st.hashes;const apply={};let applied=false,conflict=false;
+        for(const id in remote){const rh=hs(remote[id].json);const lh=(id in local)?hs(local[id]):null;
+          if(rh===H[id])continue;
+          if(lh===rh){H[id]=rh;continue;}
+          if(lh!==null&&lh!==H[id]){conflict=true;continue;}
+          apply[id]=remote[id].json;H[id]=rh;applied=true;}
+        if(applied){const merged=Object.assign({},local,apply);const S2=joinDocs(merged,S);
+          if(S2){ctl.hooks.setS(S2);local=splitDocs(S2);}}
+        for(const id in local){const h=hs(local[id]);if(H[id]!==h){await remotePut(id,local[id]);H[id]=h;}}
+        st.hashes=H;persist();
+        if(conflict)ctl.msg='تعارض: الاحتفاظ بنسخة هذا الجهاز';
+      }
+      st.last=Date.now();persist();ctl.busy=false;setStatus('ok',ctl.msg);ctl.msg='';
+      if(ctl.again){ctl.again=false;sync();}
+    }catch(e){
+      ctl.busy=false;ctl.again=false;
+      const m=String(e&&e.message);
+      if(m==='OFFLINE')setStatus('offline');
+      else if(m==='NEEDPASS'||m==='BADPASS'){setStatus('badpass',errAr(e));}
+      else if(/TOKEN_EXPIRED|INVALID_REFRESH_TOKEN|USER_NOT_FOUND|USER_DISABLED/.test(m)){st.auth=null;ctl.idToken=null;persist();setStatus('signedout',errAr(e));}
+      else setStatus('error',errAr(e));
+    }
+  }
+  function schedule(){if(!st.cfg||!st.auth||!st.init)return;clearTimeout(ctl.timer);ctl.timer=setTimeout(sync,1500);}
+  /* ---- public actions ---- */
+  function parseConfig(text){
+    const k=/apiKey["']?\s*[:=]\s*["']([^"']+)["']/.exec(text),p=/projectId["']?\s*[:=]\s*["']([^"']+)["']/.exec(text);
+    if(!k||!p)return null;return{apiKey:k[1],projectId:p[1]};}
+  function configure(text){const c=parseConfig(text);if(!c)return false;st.cfg=c;st.auth=null;st.init=false;st.hashes={};persist();ctl.hooks.onUpdate();return true;}
+  async function signIn(email,pw,pass,create){
+    const r=await authCall(create?'signUp':'signInWithPassword',{email,password:pw,returnSecureToken:true});
+    st.auth={uid:r.localId,email:r.email||email,refresh:r.refreshToken};ctl.idToken=r.idToken;ctl.exp=Date.now()+(+r.expiresIn||3600)*1000;
+    st.pass=pass||'';st.init=false;st.hashes={};kc={id:'',k:null};persist();
+    await sync();}
+  async function resetPassword(email){await authCall('sendOobCode',{requestType:'PASSWORD_RESET',email});}
+  function signOut(){st.auth=null;st.pass='';st.init=false;st.hashes={};ctl.idToken=null;ctl.choice=null;clearTimeout(ctl.timer);persist();setStatus('signedout');}
+  function clearConfig(){signOut();st.cfg=null;persist();ctl.hooks.onUpdate();}
+  async function resolveChoice(which){
+    ctl.busy=true;setStatus('syncing');
+    try{
+      const S=ctl.hooks.getS();const remote=await remoteList();const rj=Object.fromEntries(Object.keys(remote).map(i=>[i,remote[i].json]));
+      if(which==='remote'){try{localStorage.setItem('masrofi.v1.prebackup',JSON.stringify(S));}catch(e){}
+        const S2=joinDocs(rj,S);if(!S2)throw mk('بيانات السحابة غير مفهومة');ctl.hooks.setS(S2);st.hashes=hashMap(rj);}
+      else{const local=splitDocs(S);for(const id in local)await remotePut(id,local[id]);for(const id in remote)if(!(id in local))await remoteDel(id);st.hashes=hashMap(local);}
+      st.init=true;ctl.choice=null;st.last=Date.now();persist();ctl.busy=false;setStatus('ok');
+    }catch(e){ctl.busy=false;setStatus('error',errAr(e));}}
+  async function forceUpload(){ // after a restore: make the cloud copy identical to this device
+    if(!st.cfg||!st.auth)return;ctl.busy=true;setStatus('syncing');
+    try{const S=ctl.hooks.getS();const local=splitDocs(S);const remote=await remoteList();
+      for(const id in local)await remotePut(id,local[id]);for(const id in remote)if(!(id in local))await remoteDel(id);
+      st.hashes=hashMap(local);st.init=true;st.last=Date.now();persist();ctl.busy=false;setStatus('ok');}
+    catch(e){ctl.busy=false;setStatus('error',errAr(e));}}
+  function start(){
+    if(!st.cfg||!st.auth)return;
+    sync();
+    document.addEventListener('visibilitychange',()=>{if(!document.hidden)sync();});
+    window.addEventListener('online',()=>sync());
+    setInterval(()=>{if(!document.hidden)sync();},60000);}
+  return{get st(){return st;},get ctl(){return ctl;},hooks:h=>Object.assign(ctl.hooks,h),configure,signIn,signOut,resetPassword,clearConfig,resolveChoice,forceUpload,sync,schedule,start,errAr,splitDocs,joinDocs,hs,
+    active:()=>!!(st.cfg&&st.auth),hasCfg:()=>!!st.cfg,email:()=>st.auth&&st.auth.email,pass:()=>!!st.pass};
+})();
+
 /* ===== APP / UI ===== */
 const KEY='masrofi.v1';
 const CAN_DL=/*DL*/true;
@@ -350,6 +516,7 @@ function load(){
 }
 function save(){
   try{localStorage.setItem(KEY,JSON.stringify(S));saveErr=false;}catch(e){saveErr=true;}
+  if(!ui.noCloud&&typeof Cloud!=='undefined')Cloud.schedule();
 }
 async function sha(s){
   try{const b=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(s));return [...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,'0')).join('');}
@@ -387,13 +554,53 @@ function storageBanner(){
   return `<div class="banner bad"><span>هذا المتصفح لا يسمح بحفظ البيانات، وستضيع عند إغلاق الصفحة. خذ نسخة احتياطية قبل الخروج.</span></div>`;
 }
 
+
+/* ---------- cloud UI ---------- */
+const CHIPS={syncing:['☁ …','info'],ok:['☁ ✓','paid'],offline:['☁ بدون اتصال','due'],error:['☁ مشكلة','late'],badpass:['☁ العبارة','late'],needChoice:['☁ اختر','due'],idle:['☁','info'],signedout:['☁ خارج','due']};
+function chipHtml(){
+  if(typeof Cloud==='undefined'||!Cloud.active())return '<span id="cchip"></span>';
+  const c=CHIPS[Cloud.ctl.status]||CHIPS.idle;
+  return `<span id="cchip"><button class="pill ${c[1]}" style="border:0" data-act="tab" data-v="settings">${c[0]}</button></span>`;
+}
+function inputFocused(){const a=document.activeElement;return !!(a&&a.closest&&a.closest('#root')&&/^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName));}
+function cloudChanged(){
+  const el=document.getElementById('cchip');if(el)el.outerHTML=chipHtml();
+  if(ui.tab==='settings'&&!inputFocused()&&!ui.modal)render();
+}
+function cloudDataChanged(){if(inputFocused()||ui.modal){ui.pendingRender=true;}else render();}
+function cloudSection(){
+  if(typeof Cloud==='undefined')return '';
+  const c=Cloud.ctl,st=Cloud.st;
+  const stateTxt={syncing:'جاري المزامنة…',ok:'متزامن'+(st.last?' · آخر مزامنة '+new Date(st.last).toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'}):''),offline:'بدون اتصال. تُحفظ على جهازك وتُرفع لما يرجع الاتصال.',error:c.msg||'مشكلة في المزامنة',badpass:c.msg,needChoice:'تحتاج قرارك',idle:'',signedout:c.msg||'غير مسجّل'}[c.status]||'';
+  let h=`<div class="sec"><div class="sechead"><h2>المزامنة بين الأجهزة</h2><small>${Cloud.active()?'مفعّلة':'غير مفعّلة'}</small></div><div class="panel pad">`;
+  if(!Cloud.hasCfg()){
+    h+=`<p class="note" style="margin-top:0">تحفظ بياناتك في حسابك على Firebase وتظهر على كل أجهزتك. الصق هنا إعداد المشروع (الكتلة اللي فيها apiKey و projectId) من لوحة Firebase.</p>
+    <form data-form="cloudCfg"><div class="fld"><label for="cc_txt">إعداد Firebase</label><textarea id="cc_txt" name="txt" dir="ltr" style="text-align:left" placeholder="const firebaseConfig = { apiKey: &quot;...&quot;, projectId: &quot;...&quot; }"></textarea></div><button class="btn" type="submit" style="margin-top:8px">حفظ الإعداد</button></form>`;
+  }else if(!Cloud.active()){
+    h+=`${stateTxt?`<div class="banner warn" style="display:block">${esc(stateTxt)}</div>`:''}
+    <form data-form="cloudLogin"><div class="fld"><label for="cl_email">الإيميل</label><input id="cl_email" class="plain" name="email" type="email" dir="ltr" autocomplete="email" style="text-align:left"></div>
+    <div class="fld" style="margin-top:8px"><label for="cl_pw">كلمة السر</label><input id="cl_pw" class="plain" name="pw" type="password" dir="ltr" autocomplete="current-password" style="text-align:left"></div>
+    <div class="fld" style="margin-top:8px"><label for="cl_pass">عبارة التشفير (أنصح بها)</label><input id="cl_pass" class="plain" name="pass" type="password" dir="ltr" autocomplete="off" style="text-align:left"></div>
+    <p class="note">مع عبارة التشفير تنحفظ بياناتك مشفّرة، وما يقدر أحد يقرأها حتى Google. لو نسيتها ما فيه طريقة لاسترجاع البيانات من السحابة. استخدم نفس العبارة في كل أجهزتك.</p>
+    <div class="row" style="gap:8px"><button class="btn" type="submit" data-mode="login">دخول</button><button class="btn ghost" type="submit" data-mode="signup">إنشاء حساب</button></div></form>
+    <div class="row" style="gap:12px;margin-top:12px"><button class="linkb" type="button" data-act="cloudReset">نسيت كلمة السر</button><button class="linkb" type="button" data-confirm="1" data-act="cloudClear">حذف الإعداد</button></div>`;
+  }else{
+    h+=`<div class="dgrid" style="margin-top:0"><div><small>الحساب</small><b style="font-size:.85rem" dir="ltr">${esc(Cloud.email())}</b></div><div><small>الحالة</small><b style="font-size:.85rem">${esc(stateTxt)}</b></div><div><small>التشفير</small><b>${Cloud.pass()?'مفعّل':'غير مفعّل'}</b></div></div>`;
+    if(c.status==='needChoice'&&c.choice){const r=c.choice.remote,l=c.choice.local;
+      h+=`<div class="banner warn" style="display:block"><b>فيه بيانات في السحابة وبيانات في هذا الجهاز.</b><br>السحابة: ${r.months} شهر، ${r.debts} دين، ${r.planned} مشتريات. هذا الجهاز: ${l.months} شهر، ${l.debts} دين، ${l.planned} مشتريات.<div class="row" style="gap:8px;margin-top:10px"><button class="btn sm" data-confirm="1" data-act="cloudUseRemote">استخدم بيانات السحابة</button><button class="btn sm coral" data-confirm="1" data-act="cloudUseLocal">ارفع بيانات هذا الجهاز</button></div><div class="note">الأول يستبدل بيانات هذا الجهاز (تنحفظ نسخة منها). الثاني يستبدل السحابة.</div></div>`;}
+    h+=`<div class="row" style="gap:8px;margin-top:12px"><button class="btn" data-act="cloudSync">مزامنة الآن</button><button class="btn ghost" data-confirm="1" data-act="cloudOut">تسجيل خروج</button></div>
+    <p class="note">التعديلات تُرفع تلقائياً، وتنزل التعديلات من الأجهزة الثانية كل دقيقة وعند فتح التطبيق. لو عدّلت نفس الشهر على جهازين في نفس الوقت، تبقى نسخة الجهاز اللي يزامن آخر.</p>`;
+  }
+  return h+'</div></div>';
+}
+
 /* ---------- views ---------- */
 function topbar(){
   let h='';
   const titles={summary:'ملخص السنة',month:'الميزانية الشهرية',debts:'الديون',settings:'الإعدادات'};
   const yr=(ui.tab==='month'||ui.tab==='summary');
   const yv=ui.tab==='summary'?ui.sumY:ui.y;
-  h+=`<div class="top"><div class="titlebar"><h1>${titles[ui.tab]}</h1>`;
+  h+=`<div class="top"><div class="titlebar"><h1>${titles[ui.tab]}</h1>${chipHtml()}`;
   if(yr) h+=`<div class="yearbox"><button data-act="year" data-d="-1" aria-label="السنة السابقة">›</button><b class="num">${yv}</b><button data-act="year" data-d="1" aria-label="السنة التالية">‹</button></div>`;
   h+='</div>';
   if(ui.tab==='month'){
@@ -553,6 +760,7 @@ function vSettings(){
    <div class="note" style="margin:0 0 8px">البنود وحدودها الافتراضية (اترك الحد فارغاً أو 0 لبند بدون حد):</div>`;
   S.settings.items.forEach((it,k)=>{h+=`<div class="row" style="margin-bottom:8px"><span class="dotc" style="background:${ITEM_COLORS[k]};margin-bottom:17px"></span><div class="fld" style="flex:2 1 140px"><input class="plain" name="n_${it.id}" value="${esc(it.name)}" aria-label="اسم البند ${k+1}"></div><div class="fld"><input class="plain" name="l_${it.id}" inputmode="decimal" value="${it.limit||''}" placeholder="الحد" aria-label="حد ${esc(it.name)}"></div></div>`;});
   h+=`<button class="btn teal" type="submit" style="width:100%;margin-top:6px">حفظ</button></form></div></div>`;
+  h+=cloudSection();
   // backup
   const a=backupAgeDays();
   h+=`<div class="sec"><div class="sechead"><h2>النسخة الاحتياطية</h2><small>${a===null?'لم تؤخذ بعد':'آخر نسخة قبل '+a+' يوم'}</small></div><div class="panel pad">
@@ -639,6 +847,13 @@ document.addEventListener('click',async e=>{
         onSubmit:v=>{p.name=v.name.trim();p.amt=Math.max(0,num(v.amt));p.note=v.note.trim();ui.modal=null;changed('تم التعديل');}}); break;}
     case 'addDebt': debtModal(null); break;
     case 'editDebt': debtModal(S.debts.find(z=>z.id===d.id)); break;
+    case 'cloudSync': Cloud.sync(); break;
+    case 'cloudOut': Cloud.signOut(); render(); break;
+    case 'cloudClear': Cloud.clearConfig(); render(); break;
+    case 'cloudReset': {const em=(document.getElementById('cl_email')||{}).value||'';if(!em.trim()){toast('اكتب الإيميل أولاً ثم اضغط «نسيت كلمة السر»');break;}
+      try{await Cloud.resetPassword(em.trim());toast('أرسلنا رابط تغيير كلمة السر لإيميلك');}catch(err){toast(Cloud.errAr(err));}break;}
+    case 'cloudUseRemote': await Cloud.resolveChoice('remote'); render(); break;
+    case 'cloudUseLocal': await Cloud.resolveChoice('local'); render(); break;
     case 'download': {const t=exportJson();try{const blob=new Blob([t],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);
         const n=new Date();a.download=`mizaniyati-${n.getFullYear()}-${String(n.getMonth()+1).padStart(2,'0')}-${String(n.getDate()).padStart(2,'0')}.json`;document.body.appendChild(a);a.click();a.remove();
         S.settings.lastBackup=Date.now();changed('تم تنزيل النسخة. إن لم يبدأ التنزيل استخدم «نسخ النص».');}catch(err){ui.showExport=true;ui.exportText=t;toast('التنزيل غير متاح هنا. انسخ النص بدلاً منه.');} break;}
@@ -653,10 +868,11 @@ document.addEventListener('click',async e=>{
         ui.importPending={S:o,nm,debts:o.debts.length,planned:o.planned.length};render();};
       if(txt) handle(txt); else if(f){const fr=new FileReader();fr.onload=()=>handle(String(fr.result));fr.onerror=()=>toast('تعذّر قراءة الملف');fr.readAsText(f);} else toast('اختر ملفاً أو الصق النص');
       break;}
-    case 'importDo': S=ui.importPending.S; ui.importPending=null; changed('تم استرجاع بياناتك'); break;
+    case 'importDo': S=ui.importPending.S; ui.importPending=null; ui.noCloud=true; changed('تم استرجاع بياناتك'); ui.noCloud=false; if(typeof Cloud!=='undefined'&&Cloud.active())Cloud.forceUpload(); break;
     case 'importCancel': ui.importPending=null; render(); break;
-    case 'demo': S=demoState(NOW.getFullYear()); ui.y=NOW.getFullYear(); ui.m=1; ui.tab='month'; changed('تم تحميل بيانات تجريبية (فيها كلمة «مثال»)'); break;
-    case 'wipe': {const pin=S.settings.pin;S=defState();S.settings.pin=pin;changed('تم مسح البيانات');break;}
+    case 'demo': if(typeof Cloud!=='undefined'&&Cloud.active()){toast('سجّل خروج من المزامنة أولاً');break;}
+      S=demoState(NOW.getFullYear()); ui.y=NOW.getFullYear(); ui.m=1; ui.tab='month'; changed('تم تحميل بيانات تجريبية (فيها كلمة «مثال»)'); break;
+    case 'wipe': {if(typeof Cloud!=='undefined'&&Cloud.active()){toast('سجّل خروج من المزامنة أولاً');break;}const pin=S.settings.pin;S=defState();S.settings.pin=pin;changed('تم مسح البيانات');break;}
   }
 });
 function debtModal(d){
@@ -692,6 +908,14 @@ document.addEventListener('submit',async e=>{
     if(np===''){S.settings.pin=null;changed(S.settings.pin===null?'تم إلغاء القفل':'');return;}
     if(!/^\d{4,}$/.test(np)){toast('الرمز أرقام فقط، 4 أو أكثر');return;}
     S.settings.pin=await hashPin(np);changed('تم تفعيل القفل');}
+  else if(kind==='cloudCfg'){if(Cloud.configure(String(fd.txt||''))){toast('تم حفظ الإعداد');render();}else toast('ما لقيت apiKey و projectId في النص');}
+  else if(kind==='cloudLogin'){const create=(e.submitter&&e.submitter.dataset.mode)==='signup';
+    const em=String(fd.email||'').trim(),pw=String(fd.pw||''),ps=String(fd.pass||'');
+    if(!em||!pw){toast('اكتب الإيميل وكلمة السر');return;}
+    toast('جاري الدخول…');
+    try{await Cloud.signIn(em,pw,ps,create);}catch(err){toast(Cloud.errAr(err));render();return;}
+    if(Cloud.ctl.status==='badpass'){const m=Cloud.ctl.msg;Cloud.signOut();toast(m);}else toast(create?'تم إنشاء الحساب':'تم الدخول');
+    render();}
   else if(kind==='modal'){const r=ui.modal.onSubmit(fd);if(typeof r==='string'){toast(r);}}
   else if(kind==='unlock'){if(await checkPin(String(fd.pin||''),S.settings.pin)){ui.locked=false;ui.lockErr=false;render();}else{ui.lockErr=true;render();}}
 });
@@ -705,7 +929,10 @@ S=load();
 if(S.settings.pin) ui.locked=true;
 try{if(navigator.storage&&navigator.storage.persist) navigator.storage.persist();}catch(e){}
 try{if('serviceWorker' in navigator&&location.protocol.startsWith('http')) navigator.serviceWorker.register('sw.js').catch(()=>{});}catch(e){}
+if(typeof Cloud!=='undefined'){Cloud.hooks({getS:()=>S,setS:o=>{S=o;ui.noCloud=true;save();ui.noCloud=false;cloudDataChanged();},onUpdate:cloudChanged});}
+document.addEventListener('focusout',()=>{if(ui.pendingRender){setTimeout(()=>{if(!inputFocused()&&!ui.modal){ui.pendingRender=false;render();}},50);}});
 render();
+if(typeof Cloud!=='undefined')Cloud.start();
 
 </script>
 </body></html>
